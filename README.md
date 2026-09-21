@@ -9,29 +9,24 @@ The challenge is to classify lunar surface crops into two categories:
 * **Class 0 — Depth:** Craters, holes, and surface depressions
 * **Class 1 — Rise:** Mounds, hills, rocks, and boulders
 
-A major challenge is that the appearance of a lunar feature changes depending on the direction of sunlight. The same physical structure can produce very different shadow patterns under different **sun azimuth angles**.
+The main challenge is the effect of **sun azimuth** on the appearance of lunar terrain. The same physical feature can produce different shadow patterns depending on the direction of illumination.
 
-The dataset contains:
-
-* **7,854** labeled training images
-* **2,000** test images
-* `train_metadata.csv`
-* `test_metadata.csv`
+The dataset consists of **7,854 labeled training images** and **2,000 test images**, along with metadata containing the corresponding sun azimuth angles.
 
 The evaluation metric is **Balanced Accuracy**, calculated as the average recall across both classes.
 
 ## 🧠 Approach
 
-The solution combines visual features with illumination information:
+Our solution combines image features with illumination information:
 
-* **ResNet34** backbone for extracting image features.
-* **FiLM conditioning** to incorporate the sun azimuth information into the visual representation.
+* **ResNet34** backbone for extracting visual features.
+* **FiLM conditioning** to incorporate sun azimuth information.
 * **Late-fusion azimuth conditioning** to provide additional lighting context.
-* **Azimuth-aligned Sobel gradients** to capture surface changes along the direction of illumination.
-* **5-Fold Stratified Cross-Validation** to train an ensemble of models.
-* **Test-Time Augmentation (TTA)** during inference for more robust predictions.
+* **Azimuth-aligned Sobel gradients** to capture surface changes along the illumination direction.
+* **5-Fold Stratified Cross-Validation** for an ensemble of models.
+* **Test-Time Augmentation (TTA)** during inference.
 
-The directional gradient features are particularly useful for distinguishing **convex structures such as rocks and mounds** from **concave structures such as craters and holes**, where shadow geometry plays an important role.
+The directional gradient features help the model distinguish **convex structures such as rocks and mounds** from **concave structures such as craters and holes** based on their illumination and shadow patterns.
 
 ## 📊 Results
 
@@ -44,21 +39,22 @@ The directional gradient features are particularly useful for distinguishing **c
 | GPU                          |         **NVIDIA T4** |
 | Test Predictions             |             **2,000** |
 
-The validation score is based on the **out-of-fold predictions** from the 5-fold ensemble.
-
 ## 📁 Repository Structure
 
-```text
-├── train.py
-├── inference.py
-├── submission.csv
-└── README.md
-```
-
-* `train.py` — Trains the 5-fold ensemble.
-* `inference.py` — Runs TTA, ensembles the fold predictions, and generates `submission.csv`.
+| File               | Description                                    |
+| ------------------ | ---------------------------------------------- |
+| `train.py`         | Training pipeline with 5-Fold Cross-Validation |
+| `inference.py`     | Model inference, TTA, and ensemble predictions |
+| `requirements.txt` | Python dependencies                            |
+| `submission.csv`   | Final predictions for the 2,000 test images    |
 
 ## 🚀 Usage
+
+### Install Dependencies
+
+```bash
+pip install -r requirements.txt
+```
 
 ### Training
 
@@ -72,13 +68,7 @@ python train.py
 python inference.py
 ```
 
-The final submission is saved as:
-
-```text
-submission.csv
-```
-
-with the required columns:
+The final predictions are generated in `submission.csv` with:
 
 ```text
 image_id,label
