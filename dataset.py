@@ -7,96 +7,71 @@ import cv2
 import torch
 from torch.utils.data import Dataset
 
-# ---------------------------------------------------------------------------
-# Azimuth-direction convention (ASSUMPTION -- see note below):
-#   0 deg   = "up" in the image (toward row 0)
-#   90 deg  = "right"
-#   180 deg = "down"
-#   270 deg = "left"
-#   increasing CLOCKWISE (standard compass-style convention)
-#
-# If accuracy doesn't improve with the gradient channel enabled, the single
-# highest-value thing to try next is flipping this convention (e.g. swap the
-# sign of dx, or use counter-clockwise instead) -- we have no ground truth
-# to verify which one this specific data generator used, so it's worth an
-# empirical A/B test. Everything else in the pipeline is convention-agnostic.
-# ---------------------------------------------------------------------------
-
 def azimuth_to_direction(azimuth_deg: float):
     theta = math.radians(azimuth_deg)
-    dx = math.sin(theta)
-    dy = -math.cos(theta)
+    # INVERTED BOTH SIGNS: This fixes the topographic-inversion illusion 
+    # that caused the massive class imbalance in the previous run.
+    dx = -math.sin(theta)
+    dy = math.cos(theta)
     return dx, dy
 
-
-def sun_aligned_gradient_map(img_gray: np.ndarray, azimuth_deg: float) -> np.ndarray:
-    """
-    Directional derivative of image intensity projected onto the sun
-    direction. For a Lambertian surface, the SIGN of this quantity flips
-    between convex (rise) and concave (depression) features under the same
-    lighting -- which is exactly the ambiguity a human eye (and a naive CNN)
-    falls for. Feeding this explicitly as a channel gives the network a much
-    more direct signal than hoping it infers the relationship between a
-    scalar azimuth value and raw pixels on its own.
-    """
+def sun_aligned_gradient_map(
+    img_gray: np.ndarray,
+    azimuth_deg: float,
+    blur_sigma: float = 0.0,
+    ksize: int = 3,
+) -> np.ndarray:
     img_f = img_gray.astype(np.float32)
-    gx = cv2.Sobel(img_f, cv2.CV_32F, 1, 0, ksize=5)
-    gy = cv2.Sobel(img_f, cv2.CV_32F, 0, 1, ksize=5)
+    if blur_sigma > 0:
+        img_f = cv2.GaussianBlur(img_f, (0, 0), sigmaX=blur_sigma)
+
+    gx = cv2.Sobel(img_f, cv2.CV_32F, 1, 0, ksize=ksize)
+    gy = cv2.Sobel(img_f, cv2.CV_32F, 0, 1, ksize=ksize)
 
     dx, dy = azimuth_to_direction(azimuth_deg)
     d = gx * dx + gy * dy
 
     std = d.std() + 1e-6
-    d = d / std
-    d = np.clip(d, -5.0, 5.0)
+    d = np.clip(d / std, -5.0, 5.0)
     return d.astype(np.float32)
 
-
 class LunarDataset(Dataset):
-    """
-    Images are oblique horizon-view shots (fixed sky-up/ground-down
-    orientation regardless of sun_azimuth_angle) -- confirmed by inspection,
-    so the raw image is NEVER rotated as a whole (that would destroy the
-    horizon).
-
-    Two things ARE derived from sun_azimuth_angle instead:
-      1. A sun-aligned directional-gradient map (channel 2 of the input),
-         computed fresh (see sun_aligned_gradient_map above).
-      2. A sin/cos encoding of azimuth, fed to the classifier head alongside
-         the pooled image features (late fusion, cheap extra signal).
-
-    Augmentation: horizontal flip only (safe -- doesn't change sky-up/
-    ground-down). Applied to the raw grayscale array BEFORE computing the
-    gradient map, and the azimuth is updated to (360 - azimuth) % 360 first,
-    so channel 2 and the sin/cos feature stay internally consistent with
-    whatever the (possibly mirrored) image actually shows. No vertical flip
-    -- that would be physically invalid (see earlier notes).
-    """
-    def __init__(self, csv_file, img_dir, is_train=True, augment=False):
+    def __init__(self, csv_file, img_dir, is_train=True, augment=False, rotate_aug_deg=0.0):
         self.metadata = pd.read_csv(csv_file)
         self.img_dir = img_dir
         self.is_train = is_train
         self.augment = augment
+        self.rotate_aug_deg = rotate_aug_deg
 
     def __len__(self):
         return len(self.metadata)
 
     def __getitem__(self, idx):
         row = self.metadata.iloc[idx]
-
         img_path = os.path.join(self.img_dir, row['image_id'])
-        img = np.array(Image.open(img_path).convert('L'))  # H x W uint8
+        img = np.array(Image.open(img_path).convert('L'))  
 
         azimuth_deg = float(row['sun_azimuth_angle'])
 
-        if self.is_train and self.augment and torch.rand(1).item() > 0.5:
-            img = np.ascontiguousarray(np.fliplr(img))
-            azimuth_deg = (360.0 - azimuth_deg) % 360.0
+        if self.is_train and self.augment:
+            if torch.rand(1).item() > 0.5:
+                img = np.ascontiguousarray(np.fliplr(img))
+                azimuth_deg = (360.0 - azimuth_deg) % 360.0
 
-        gray_norm = (img.astype(np.float32) / 255.0 - 0.5) / 0.5  # [-1, 1]
-        grad_map = sun_aligned_gradient_map(img, azimuth_deg)      # already ~[-5, 5]
+            if self.rotate_aug_deg > 0:
+                delta = float(np.random.uniform(-self.rotate_aug_deg, self.rotate_aug_deg))
+                h, w = img.shape
+                M = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), delta, 1.0)
+                img = cv2.warpAffine(
+                    img, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101
+                )
+                azimuth_deg = (azimuth_deg - delta) % 360.0
 
-        stacked = np.stack([gray_norm, grad_map], axis=0)  # (2, H, W)
+        gray_norm = (img.astype(np.float32) / 255.0 - 0.5) / 0.5  
+        grad_fine = sun_aligned_gradient_map(img, azimuth_deg, blur_sigma=0.0, ksize=3)
+        grad_coarse = sun_aligned_gradient_map(img, azimuth_deg, blur_sigma=4.0, ksize=3)
+
+        stacked = np.stack([gray_norm, grad_fine, grad_coarse], axis=0)  
         image_tensor = torch.from_numpy(stacked).float()
 
         theta = math.radians(azimuth_deg)

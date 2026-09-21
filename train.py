@@ -1,17 +1,21 @@
 import json
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import balanced_accuracy_score
-import pandas as pd
 from tqdm import tqdm
 
 from dataset import LunarDataset
 from model import get_lunar_model
 
+N_FOLDS = 5              
+EPOCHS_PER_FOLD = 3      # Ultra-fast iteration limit
+BACKBONE = "resnet34"    
+PATIENCE = 6
 
 def build_sampler(labels: np.ndarray) -> WeightedRandomSampler:
     class_counts = np.bincount(labels)
@@ -23,122 +27,129 @@ def build_sampler(labels: np.ndarray) -> WeightedRandomSampler:
         replacement=True,
     )
 
-
-def get_val_probs(model, val_loader, device):
-    """Returns (probs_class1, true_labels) for the whole val set."""
+def get_probs(model, loader, device):
     model.eval()
-    all_probs, all_labels = [], []
+    probs, labels = [], []
     with torch.no_grad():
-        for images, azimuth_feat, labels in val_loader:
+        for images, azimuth_feat, y in loader:
             images, azimuth_feat = images.to(device), azimuth_feat.to(device)
-            logits = model(images, azimuth_feat)
-            probs = torch.softmax(logits, dim=1)[:, 1]
-            all_probs.extend(probs.cpu().numpy())
-            all_labels.extend(labels.numpy())
-    return np.array(all_probs), np.array(all_labels)
-
+            p = torch.softmax(model(images, azimuth_feat), dim=1)[:, 1]
+            probs.extend(p.cpu().numpy())
+            labels.extend(y.numpy())
+    return np.array(probs), np.array(labels)
 
 def tune_threshold(probs: np.ndarray, labels: np.ndarray):
-    """Sweep the decision threshold on P(class 1) to maximize balanced accuracy."""
     best_thresh, best_bacc = 0.5, -1.0
     for t in np.arange(0.05, 0.96, 0.01):
-        preds = (probs >= t).astype(int)
-        b = balanced_accuracy_score(labels, preds)
+        b = balanced_accuracy_score(labels, (probs >= t).astype(int))
         if b > best_bacc:
             best_bacc, best_thresh = b, t
     return float(best_thresh), float(best_bacc)
 
+def train_one_fold(fold: int, train_idx, val_idx, train_df, device):
+    train_full = LunarDataset('data/train_metadata.csv', 'data/train_images/', is_train=True, augment=True)
+    val_full = LunarDataset('data/train_metadata.csv', 'data/train_images/', is_train=True, augment=False)
+
+    train_ds = Subset(train_full, train_idx)
+    val_ds = Subset(val_full, val_idx)
+
+    sampler = build_sampler(train_df['label'].values[train_idx])
+    train_loader = DataLoader(train_ds, batch_size=32, sampler=sampler, num_workers=2)
+    val_loader = DataLoader(val_ds, batch_size=32, shuffle=False, num_workers=2)
+
+    model = get_lunar_model(backbone_name=BACKBONE, pretrained=True, in_channels=3).to(device)
+    criterion = nn.CrossEntropyLoss()  
+    optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
+
+    warmup_epochs = 0 # Removed warmup for short 3 epoch run
+    def lr_lambda(epoch):
+        progress = epoch / max(1, EPOCHS_PER_FOLD)
+        return 0.5 * (1 + np.cos(np.pi * progress))
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+    ckpt_path = f'best_lunar_model_fold{fold}.pth'
+    best_bacc = -1.0
+    no_improve = 0
+
+    for epoch in range(EPOCHS_PER_FOLD):
+        model.train()
+        total_loss = 0.0
+        for images, azimuth_feat, y in tqdm(train_loader, desc=f"Fold {fold} Epoch {epoch+1}/{EPOCHS_PER_FOLD}"):
+            images, azimuth_feat, y = images.to(device), azimuth_feat.to(device), y.to(device)
+            optimizer.zero_grad()
+            out = model(images, azimuth_feat)
+            loss = criterion(out, y)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        scheduler.step()
+
+        probs, y_val = get_probs(model, val_loader, device)
+        bacc = balanced_accuracy_score(y_val, (probs >= 0.5).astype(int))
+        print(f"[Fold {fold}] Epoch {epoch+1}: loss={total_loss/len(train_loader):.4f} "
+              f"val_bacc@0.5={bacc:.4f}  lr={scheduler.get_last_lr()[0]:.2e}")
+
+        if bacc > best_bacc:
+            best_bacc = bacc
+            no_improve = 0
+            torch.save(model.state_dict(), ckpt_path)
+        else:
+            no_improve += 1
+            if no_improve >= PATIENCE:
+                print(f"[Fold {fold}] Early stopping at epoch {epoch+1} (best={best_bacc:.4f}).")
+                break
+
+    model.load_state_dict(torch.load(ckpt_path, map_location=device, weights_only=True))
+    probs, y_val = get_probs(model, val_loader, device)
+    print(f"[Fold {fold}] final best val_bacc@0.5 = {best_bacc:.4f}\n")
+    return probs, val_idx
 
 def train():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
     train_df = pd.read_csv('data/train_metadata.csv')
-    indices = list(range(len(train_df)))
-    train_idx, val_idx = train_test_split(
-        indices, test_size=0.2, random_state=42, stratify=train_df['label'].values
-    )
+    labels_all = train_df['label'].values
+    n = len(train_df)
 
-    # Two separate dataset instances -- never share one object between
-    # train/val Subsets (mutating .augment on one would mutate both).
-    train_full = LunarDataset('data/train_metadata.csv', 'data/train_images/', is_train=True, augment=True)
-    val_full = LunarDataset('data/train_metadata.csv', 'data/train_images/', is_train=True, augment=False)
+    n_folds = max(2, N_FOLDS) if N_FOLDS > 1 else 1
 
-    train_dataset = Subset(train_full, train_idx)
-    val_dataset = Subset(val_full, val_idx)
+    if n_folds == 1:
+        from sklearn.model_selection import train_test_split
+        idx = np.arange(n)
+        train_idx, val_idx = train_test_split(idx, test_size=0.2, random_state=42, stratify=labels_all)
+        probs, val_idx_ret = train_one_fold(0, train_idx, val_idx, train_df, device)
+        oof_probs = np.full(n, np.nan)
+        oof_probs[val_idx_ret] = probs
+        mask = ~np.isnan(oof_probs)
+        oof_probs_eval, labels_eval = oof_probs[mask], labels_all[mask]
+    else:
+        skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+        oof_probs = np.zeros(n)
+        oof_assigned = np.zeros(n, dtype=bool)
 
-    train_labels = train_df['label'].values[train_idx]
-    sampler = build_sampler(train_labels)
+        for fold, (train_idx, val_idx) in enumerate(skf.split(np.zeros(n), labels_all)):
+            probs, val_idx_ret = train_one_fold(fold, train_idx, val_idx, train_df, device)
+            oof_probs[val_idx_ret] = probs
+            oof_assigned[val_idx_ret] = True
 
-    train_loader = DataLoader(train_dataset, batch_size=32, sampler=sampler, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4)
+        assert oof_assigned.all(), "Some samples were never used as validation in any fold."
+        oof_probs_eval, labels_eval = oof_probs, labels_all
 
-    model = get_lunar_model(backbone_name="resnet34", pretrained=True).to(device)
+    oof_df = train_df.copy()
+    oof_df['oof_prob_class1'] = oof_probs
+    oof_df.to_csv('oof_predictions.csv', index=False)
 
-    # Sampler already balances classes -- plain (unweighted) loss avoids
-    # double-correcting, which is what caused the class-collapse swings
-    # you saw between the vscode/colab runs.
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
+    best_thresh, best_bacc = tune_threshold(oof_probs_eval, labels_eval)
+    default_bacc = balanced_accuracy_score(labels_eval, (oof_probs_eval >= 0.5).astype(int))
 
-    epochs = 30
-    warmup_epochs = 2
-    def lr_lambda(epoch):
-        if epoch < warmup_epochs:
-            return (epoch + 1) / warmup_epochs
-        progress = (epoch - warmup_epochs) / max(1, (epochs - warmup_epochs))
-        return 0.5 * (1 + np.cos(np.pi * progress))
-    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
-
-    best_b_acc = -1.0
-    patience, no_improve = 8, 0
-
-    for epoch in range(epochs):
-        model.train()
-        train_loss = 0
-
-        for images, azimuth_feat, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
-            images, azimuth_feat, labels = images.to(device), azimuth_feat.to(device), labels.to(device)
-            optimizer.zero_grad()
-            outputs = model(images, azimuth_feat)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item()
-
-        scheduler.step()
-
-        probs, labels_np = get_val_probs(model, val_loader, device)
-        preds_default = (probs >= 0.5).astype(int)
-        b_acc_default = balanced_accuracy_score(labels_np, preds_default)
-
-        print(f"Loss: {train_loss/len(train_loader):.4f} | Val Balanced Acc (thresh=0.5): {b_acc_default:.4f}")
-        print(f"  Val pred distribution -> 0: {(preds_default==0).sum()}, 1: {(preds_default==1).sum()}"
-              f"  | true -> 0: {(labels_np==0).sum()}, 1: {(labels_np==1).sum()}")
-        print(f"  LR: {scheduler.get_last_lr()[0]:.2e}")
-
-        if b_acc_default > best_b_acc:
-            best_b_acc = b_acc_default
-            no_improve = 0
-            torch.save(model.state_dict(), 'best_lunar_model.pth')
-            print("New best model saved!")
-        else:
-            no_improve += 1
-            if no_improve >= patience:
-                print(f"Early stopping at epoch {epoch+1}.")
-                break
-
-    # --- Threshold tuning on the best checkpoint ---
-    model.load_state_dict(torch.load('best_lunar_model.pth', map_location=device, weights_only=True))
-    probs, labels_np = get_val_probs(model, val_loader, device)
-    best_thresh, best_bacc_tuned = tune_threshold(probs, labels_np)
-    print(f"\nBest val balanced acc @ default 0.5 threshold: {best_b_acc:.4f}")
-    print(f"Best val balanced acc @ tuned threshold {best_thresh:.2f}: {best_bacc_tuned:.4f}")
-
+    print(f"\n=== Out-of-fold estimate across {len(labels_eval)} training samples ===")
+    print(f"Balanced acc @ 0.5 threshold:        {default_bacc:.4f}")
+    print(f"Balanced acc @ tuned threshold {best_thresh:.2f}: {best_bacc:.4f}")
+    
     with open('best_threshold.json', 'w') as f:
         json.dump({"threshold": best_thresh}, f)
     print("Saved tuned threshold to best_threshold.json (used automatically by inference.py)")
-
 
 if __name__ == '__main__':
     train()
